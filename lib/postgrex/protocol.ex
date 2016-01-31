@@ -49,11 +49,18 @@ defmodule Postgrex.Protocol do
         :strict -> :idle
       end
 
+    prepare =
+      case opts[:prepare] || :named do
+        :named   -> :named
+        :unnamed -> :unnamed
+      end
+
     s = %__MODULE__{timeout: timeout, postgres: postgres}
 
     types_key = if types?, do: {host, port, Keyword.fetch!(opts, :database), custom}
     status = %{opts: opts, types_key: types_key, types_ref: nil,
-               types_table: nil, extensions: extensions, extension_info: nil}
+               types_table: nil, extensions: extensions, extension_info: nil,
+               prepare: prepare}
     case connect(host, port, sock_opts ++ @sock_opts, s) do
       {:ok, s} when ssl?  -> s |> ssl(status) |> connected()
       {:ok, s}            -> s |> startup(status) |> connected()
@@ -63,8 +70,7 @@ defmodule Postgrex.Protocol do
 
   defp connected({:ok, %{parameters: parameters} = s}) do
     ref = Postgrex.Parameters.insert(parameters)
-    tid = queries_new()
-    {:ok, %{s | parameters: ref, queries: tid}}
+    {:ok, %{s | parameters: ref}}
   end
   defp connected({:disconnect, err, s}) do
     disconnect(err, s)
@@ -126,6 +132,10 @@ defmodule Postgrex.Protocol do
   def handle_prepare(%Query{name: @reserved_prefix <> _} = query, _, s) do
     reserved_error(query, s)
   end
+  def handle_prepare(%Query{types: nil} = query, opts, %{queries: nil, buffer: buffer} = s) do
+    status = %{notify: notify(opts), sync: :sync, prepare: :parse_describe}
+    parse_describe_send(%{s | buffer: nil}, status, unnamed(query), buffer)
+  end
   def handle_prepare(%Query{types: nil} = query, opts, %{buffer: buffer} = s) do
     case query_member?(s, query) do
       true ->
@@ -170,6 +180,10 @@ defmodule Postgrex.Protocol do
   def handle_execute_close(%Query{name: @reserved_prefix <> _} = query, _, _, s) do
     reserved_error(query, s)
   end
+  def handle_execute_close(%Query{name: ""} = query, params, opts, s) do
+    # Do not need to close unnamed query as can be overridden.
+    handle_execute(query, params, :sync, opts, s)
+  end
   def handle_execute_close(query, params, opts, s) do
     handle_execute(query, params, :sync_close, opts, s)
   end
@@ -194,11 +208,11 @@ defmodule Postgrex.Protocol do
   def handle_begin(opts, s) do
     case Keyword.get(opts, :mode, :transaction) do
       :transaction ->
-        name = @reserved_prefix <> "BEGIN"
-        handle_transaction(name, :transaction, :begin, opts, s)
+        statement = "BEGIN"
+        handle_transaction(statement, :transaction, :begin, opts, s)
       :savepoint   ->
-        name = @reserved_prefix <> "SAVEPOINT postgrex_savepoint"
-        handle_savepoint([name], :savepoint, opts, s)
+        statement = "SAVEPOINT postgrex_savepoint"
+        handle_savepoint([statement], :savepoint, opts, s)
     end
   end
 
@@ -208,11 +222,11 @@ defmodule Postgrex.Protocol do
   def handle_commit(opts, s) do
     case Keyword.get(opts, :mode, :transaction) do
       :transaction ->
-        name = @reserved_prefix <> "COMMIT"
-        handle_transaction(name, :idle, :commit, opts, s)
+        statement = "COMMIT"
+        handle_transaction(statement, :idle, :commit, opts, s)
       :savepoint ->
-        name = @reserved_prefix <> "RELEASE SAVEPOINT postgrex_savepoint"
-        handle_savepoint([name], :release, opts, s)
+        statement = "RELEASE SAVEPOINT postgrex_savepoint"
+        handle_savepoint([statement], :release, opts, s)
     end
   end
 
@@ -222,12 +236,12 @@ defmodule Postgrex.Protocol do
   def handle_rollback(opts, s) do
     case Keyword.get(opts, :mode, :transaction) do
       :transaction ->
-        name = @reserved_prefix <> "ROLLBACK"
-        handle_transaction(name, :idle, :rollback, opts, s)
+        statement = "ROLLBACK"
+        handle_transaction(statement, :idle, :rollback, opts, s)
       :savepoint ->
-        names = [@reserved_prefix <> "ROLLBACK TO SAVEPOINT postgrex_savepoint",
-                 @reserved_prefix <> "RELEASE SAVEPOINT postgrex_savepoint"]
-        handle_savepoint(names, [:rollback, :release], opts, s)
+        statements = ["ROLLBACK TO SAVEPOINT postgrex_savepoint",
+                      "RELEASE SAVEPOINT postgrex_savepoint"]
+        handle_savepoint(statements, [:rollback, :release], opts, s)
     end
   end
 
@@ -466,8 +480,10 @@ defmodule Postgrex.Protocol do
 
   defp bootstrap_sync_recv(%{timeout: timeout} = s, status, buffer) do
     case msg_recv(s, timeout, buffer) do
-      {:ok, msg_ready(), buffer} ->
+      {:ok, msg_ready(status: :idle), buffer} ->
         reserve_send(s, status, buffer)
+      {:ok, msg_ready(status: postgres), buffer} ->
+        sync_error(s, postgres, buffer)
       {:ok, msg, buffer} ->
         bootstrap_sync_recv(handle_msg(s, status, msg), status, buffer)
       {:disconnect, _, _} = dis ->
@@ -475,7 +491,10 @@ defmodule Postgrex.Protocol do
     end
   end
 
-  defp reserve_send(s, status, buffer) do
+  defp reserve_send(s, %{prepare: :unnamed}, buffer) do
+    activate(s, buffer)
+  end
+  defp reserve_send(s, %{prepare: :named} = status, buffer) do
     case msg_send(s, reserve_msgs() ++ [msg_sync()], buffer) do
       :ok ->
         reserve_recv(s, status, buffer)
@@ -496,7 +515,7 @@ defmodule Postgrex.Protocol do
       {:ok, msg_parse_complete(), buffer} ->
         reserve_recv(s, status, buffer)
       {:ok, msg_ready(status: :idle), buffer} ->
-        activate(s, buffer)
+        activate(%{s | queries: queries_new()}, buffer)
       {:ok, msg_ready(status: postgres), buffer} ->
         sync_error(s, postgres, buffer)
       {:ok, msg_error(fields: fields), buffer} ->
@@ -604,14 +623,17 @@ defmodule Postgrex.Protocol do
   ## execute
 
   defp handle_execute(query, params, sync, opts, s) do
-    %{types: types, buffer: buffer} = s
+    %{types: types, queries: queries, buffer: buffer} = s
+    status = %{notify: notify(opts), sync: sync, prepare: :parse_execute}
     case query do
       %Query{types: nil} ->
         query_error(s, "query #{inspect query} has not been prepared")
-      %Query{types: ^types} = query ->
-       status = %{notify: notify(opts), sync: sync, prepare: :parse_execute}
-       execute_lookup(%{s | buffer: nil}, status, query, params, buffer)
-      %Query{} = query ->
+      %Query{types: ^types} when is_nil(queries) ->
+        query = unnamed(query)
+        parse_execute_send(%{s | buffer: nil}, status, query, params, buffer)
+      %Query{types: ^types} ->
+        execute_lookup(%{s | buffer: nil}, status, query, params, buffer)
+      %Query{} ->
         query_error(s, "query #{inspect query} has invalid types for the connection")
     end
   end
@@ -785,8 +807,8 @@ defmodule Postgrex.Protocol do
     transaction_send(%{s | buffer: nil}, status, name, postgres, res, buffer)
   end
 
-  defp transaction_send(s, status, name, postgres, res, buffer) do
-    msgs = transaction_msgs([name])
+  defp transaction_send(s, status, statement, postgres, res, buffer) do
+    msgs = transaction_msgs(s, [statement])
     case msg_send(s, msgs, buffer) do
       :ok ->
         transaction_recv(s, status, postgres, res, buffer)
@@ -795,13 +817,20 @@ defmodule Postgrex.Protocol do
     end
   end
 
-  defp transaction_msgs([]) do
+  defp transaction_msgs(_, []) do
      [msg_sync()]
   end
-  defp transaction_msgs([name | names]) do
+  defp transaction_msgs(%{queries: nil} = s, [statement | statements]) do
+    [msg_parse(name: "", statement: statement, type_oids: []),
+     msg_bind(name_port: "", name_stat: "", param_formats: [], params: [], result_formats: []),
+     msg_execute(name_port: "" , max_rows: 0) |
+     transaction_msgs(s, statements)]
+  end
+  defp transaction_msgs(s, [name | names]) do
+    name = [@reserved_prefix | name]
     [msg_bind(name_port: "", name_stat: name, param_formats: [], params: [], result_formats: []),
      msg_execute(name_port: "" , max_rows: 0) |
-     transaction_msgs(names)]
+     transaction_msgs(s, names)]
   end
 
   defp transaction_recv(s, status, postgres, res, buffer) do
@@ -812,6 +841,8 @@ defmodule Postgrex.Protocol do
         ok(s, res, postgres, buffer)
       {:ok, msg_ready(status: postgres), buffer} ->
         sync_error(s, postgres, buffer)
+      {:ok, msg_parse_complete(), buffer} ->
+        transaction_recv(s, status, postgres, res, buffer)
       {:ok, msg_bind_complete(), buffer} ->
         transaction_recv(s, status, postgres, res, buffer)
       {:ok, msg_command_complete(), buffer} ->
@@ -837,8 +868,8 @@ defmodule Postgrex.Protocol do
     savepoint_send(%{s | buffer: nil}, status, names, res, buffer)
   end
 
-  defp savepoint_send(s, status, names, res, buffer) do
-    msgs = transaction_msgs(names)
+  defp savepoint_send(s, status, statements, res, buffer) do
+    msgs = transaction_msgs(s, statements)
     case msg_send(s, msgs, buffer) do
       :ok ->
         savepoint_recv(s, status, res, buffer)
@@ -849,6 +880,8 @@ defmodule Postgrex.Protocol do
 
   defp savepoint_recv(%{postgres: postgres} = s, status, res, buffer) do
     case msg_recv(s, :infinity, buffer) do
+      {:ok, msg_parse_complete(), buffer} ->
+        savepoint_recv(s, status, res, buffer)
       {:ok, msg_bind_complete(), buffer} ->
         savepoint_recv(s, status, res, buffer)
       {:ok, msg_command_complete(), buffer} ->
@@ -1177,6 +1210,7 @@ defmodule Postgrex.Protocol do
   defp queries_delete(%{queries: nil}), do: true
   defp queries_delete(%{queries: queries}), do: :ets.delete(queries)
 
+  defp query_put(%{queries: nil}, _), do: :ok
   defp query_put(%{queries: queries}, query) do
     %Query{name: name, statement: statement} = query
     try do
@@ -1192,11 +1226,15 @@ defmodule Postgrex.Protocol do
     end
   end
 
+  defp unnamed(%Query{name: ""} = query), do: query
+  defp unnamed(query), do: %Query{query | name: ""}
+
   defp unnamed_query_delete(s, %Query{name: ""} = query) do
     query_delete(s, query)
   end
   defp unnamed_query_delete(_, _), do: :ok
 
+  defp query_delete(%{queries: nil}, _), do: :ok
   defp query_delete(%{queries: queries}, %Query{name: name}) do
     try do
       :ets.delete(queries, name)
@@ -1209,7 +1247,7 @@ defmodule Postgrex.Protocol do
     end
   end
 
-  defp query_member?(%{queries: queries}, query) do
+  defp query_member?(%{queries: queries}, query) when queries != nil do
     %Query{name: name, statement: statement} = query
     try do
       :ets.lookup(queries, name)
